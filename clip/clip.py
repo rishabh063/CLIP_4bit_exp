@@ -91,6 +91,46 @@ def available_models() -> List[str]:
     return list(_MODELS.keys())
 
 
+
+def convert_state_dict(state_dict):
+    """Convert in_proj_weight and in_proj_bias into separate q_proj, k_proj, v_proj weights."""
+    new_state_dict = {}
+    
+    for key, value in state_dict.items():
+        if ("visual.transformer.resblocks" in key or "transformer.resblocks" in key) and "attn.in_proj_weight" in key:
+            # Extract base name (e.g., visual.transformer.resblocks.0.attn)
+            base_name = key.replace("attn.in_proj_weight", "attn")
+            d_model = value.shape[0]  # embedding dimension
+            d_head = d_model // 3  # Each of Q, K, V is one-third of in_proj_weight
+
+            # Split the weight matrix
+            new_state_dict[f"{base_name}.q_proj.weight"] = value[:d_head, :]
+            new_state_dict[f"{base_name}.k_proj.weight"] = value[d_head:2*d_head, :]
+            new_state_dict[f"{base_name}.v_proj.weight"] = value[2*d_head:, :]
+            
+        elif ("visual.transformer.resblocks" in key or "transformer.resblocks" in key)  and "attn.in_proj_bias" in key:  # Handle biases if they exist
+            
+            base_name = key.replace("attn.in_proj_bias", "attn")
+            d_model = value.shape[0]
+            d_head = d_model // 3
+
+            # Split the bias vector
+            new_state_dict[f"{base_name}.q_proj.bias"] = value[:d_head]
+            new_state_dict[f"{base_name}.k_proj.bias"] = value[d_head:2*d_head]
+            new_state_dict[f"{base_name}.v_proj.bias"] = value[2*d_head:]
+            
+        else:
+            # Copy over everything else unchanged
+            new_state_dict[key] = value
+
+    return new_state_dict
+
+
+
+
+
+
+
 def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None):
     """Load a CLIP model
 
@@ -136,7 +176,14 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
             state_dict = torch.load(opened_file, map_location="cpu")
 
     if not jit:
-        model = build_model(state_dict or model.state_dict()).to(device)
+        state_dict=state_dict or model.state_dict()
+        # for key, value in state_dict.items():
+        #     print(key)
+        state_dict=convert_state_dict(state_dict)
+        # for key, value in state_dict.items():
+        #     print(key)
+        # state_dict=state_dict or model.state_dict()
+        model = build_model(state_dict).to(device)
         if str(device) == "cpu":
             model.float()
         return model, _transform(model.visual.input_resolution)
