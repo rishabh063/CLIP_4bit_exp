@@ -55,40 +55,125 @@ class Bottleneck(nn.Module):
         return out
 
 
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def custom_multi_head_attention_forward(
+    query, key, value,
+    num_heads,
+    q_proj, k_proj, v_proj,  # now passing modules instead of weights
+    out_proj,                # projection module for the output
+    dropout_p=0.0,
+    training=True,
+    need_weights=False,
+):
+    """
+    A simplified multi-head attention implementation that uses projection modules.
+    
+    Parameters:
+      query, key, value: Tensors of shape (L, N, E) where L is sequence length,
+                         N is batch size, and E is embed_dim.
+      q_proj, k_proj, v_proj: nn.Linear modules to project query, key, and value.
+      out_proj: nn.Linear module for the output projection.
+      num_heads: Number of attention heads.
+      dropout_p: Dropout probability.
+      training: Whether in training mode.
+      need_weights: Whether to return attention weights.
+      
+    Returns:
+      attn_output: Tensor of shape (L, N, E) after attention.
+      attn_weights: (optional) Attention weights averaged over heads.
+    """
+    tgt_len, batch_size, embed_dim = query.size()
+    head_dim = embed_dim // num_heads
+    assert head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+
+    # Apply the projection modules directly.
+    q = q_proj(query)  # shape: (L, N, embed_dim)
+    k = k_proj(key)    # shape: (S, N, embed_dim)
+    v = v_proj(value)  # shape: (S, N, embed_dim)
+    
+    # Scale query
+    scaling = float(head_dim) ** -0.5
+    q = q * scaling
+
+    # Reshape for multi-head attention.
+    def shape_projection(x):
+        L, N, E = x.size()
+        x = x.view(L, N, num_heads, head_dim)
+        x = x.permute(1, 2, 0, 3).contiguous().view(N * num_heads, L, head_dim)
+        return x
+
+    q = shape_projection(q)
+    k = shape_projection(k)
+    v = shape_projection(v)
+
+    # Calculate attention scores and probabilities.
+    attn_scores = torch.bmm(q, k.transpose(1, 2))
+    attn_probs = F.softmax(attn_scores, dim=-1)
+    if dropout_p > 0.0:
+        attn_probs = F.dropout(attn_probs, p=dropout_p, training=training)
+
+    # Compute attention output.
+    attn_output = torch.bmm(attn_probs, v)
+
+    # Reshape back to (L, N, embed_dim).
+    attn_output = attn_output.view(batch_size, num_heads, tgt_len, head_dim)
+    attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(tgt_len, batch_size, embed_dim)
+
+    # Final output projection.
+    attn_output = out_proj(attn_output)
+
+    if need_weights:
+        # Optionally average the attention weights across heads.
+        attn_weights = attn_probs.view(batch_size, num_heads, tgt_len, -1)
+        attn_weights = attn_weights.sum(dim=1) / num_heads  # shape: (N, L, S)
+        return attn_output, attn_weights
+    else:
+        return attn_output, None
+
+
+
+
 class AttentionPool2d(nn.Module):
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
-        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.positional_embedding = nn.Parameter(
+            torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5
+        )
         self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
         self.num_heads = num_heads
 
     def forward(self, x):
-        x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
-        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
-        x, _ = F.multi_head_attention_forward(
-            query=x[:1], key=x, value=x,
-            embed_dim_to_check=x.shape[-1],
+        # Convert from (N, C, H, W) to (HW, N, C)
+        x = x.flatten(start_dim=2).permute(2, 0, 1)
+        # Prepend the global (mean) token.
+        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)
+        # Add positional embedding.
+        x = x + self.positional_embedding[:, None, :].to(x.dtype)
+        
+        # Use the custom multi-head attention function.
+        x, _ = custom_multi_head_attention_forward(
+            query=x[:1],  # only the first token is used as query
+            key=x,
+            value=x,
             num_heads=self.num_heads,
-            q_proj_weight=self.q_proj.weight,
-            k_proj_weight=self.k_proj.weight,
-            v_proj_weight=self.v_proj.weight,
-            in_proj_weight=None,
-            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
-            bias_k=None,
-            bias_v=None,
-            add_zero_attn=False,
-            dropout_p=0,
-            out_proj_weight=self.c_proj.weight,
-            out_proj_bias=self.c_proj.bias,
-            use_separate_proj_weight=True,
+            q_proj=self.q_proj,
+            k_proj=self.k_proj,
+            v_proj=self.v_proj,
+            out_proj=self.c_proj,
+            dropout_p=0.0,
             training=self.training,
-            need_weights=False
+            need_weights=False,
         )
         return x.squeeze(0)
+
 
 
 class ModifiedResNet(nn.Module):
@@ -168,28 +253,142 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
-class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
-        super().__init__()
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
-        self.ln_1 = LayerNorm(d_model)
+class CustomMultiheadAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True):
+        """
+        Args:
+            embed_dim: total dimension of the model.
+            num_heads: number of parallel attention heads.
+            dropout: dropout probability on attention weights.
+            bias: If True, add bias as a module parameter.
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = nn.Dropout(dropout)
+        
+        # Ensure that embed_dim is divisible by num_heads
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.head_dim = embed_dim // num_heads
+        self.scaling = self.head_dim ** -0.5
+
+        # Define projection layers for query, key, and value.
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        # Output projection.
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                attn_mask: torch.Tensor = None, need_weights: bool = False):
+        """
+        Args:
+            query, key, value: tensors with shape (L, N, E) where L is sequence length,
+                               N is batch size, and E is embedding dimension.
+            attn_mask: (optional) mask with shape broadcastable to (N*num_heads, L, S)
+            need_weights: if True, also return attention weights averaged over heads.
+        Returns:
+            attn_output: tensor of shape (L, N, E) after attention.
+            attn_weights: (optional) tensor of shape (N, L, S) with averaged attention weights.
+        """
+        L, N, E = query.size()  # L: target sequence length, N: batch size, E: embed_dim
+        S = key.size(0)         # S: source sequence length
+
+        # 1. Project inputs to query, key, and value.
+        # Multiply query by scaling factor.
+        q = self.q_proj(query) * self.scaling  # (L, N, E)
+        k = self.k_proj(key)                   # (S, N, E)
+        v = self.v_proj(value)                 # (S, N, E)
+
+        # 2. Reshape and transpose for multi-head attention.
+        # We want shape (N * num_heads, L, head_dim) for queries,
+        # and similarly for keys and values.
+        def shape_projection(x: torch.Tensor, seq_len: int):
+            # x: (seq_len, N, E) -> (seq_len, N, num_heads, head_dim)
+            x = x.view(seq_len, N, self.num_heads, self.head_dim)
+            # Permute to (N, num_heads, seq_len, head_dim)
+            x = x.permute(1, 2, 0, 3)
+            # Merge batch and heads => (N * num_heads, seq_len, head_dim)
+            return x.reshape(N * self.num_heads, seq_len, self.head_dim)
+
+        q = shape_projection(q, L)  # (N*num_heads, L, head_dim)
+        k = shape_projection(k, S)  # (N*num_heads, S, head_dim)
+        v = shape_projection(v, S)  # (N*num_heads, S, head_dim)
+
+        # 3. Compute scaled dot-product attention.
+        # Compute raw attention scores: (N*num_heads, L, S)
+        attn_scores = torch.bmm(q, k.transpose(1, 2))
+        if attn_mask is not None:
+            # The mask should be broadcastable to attn_scores.
+            attn_scores = attn_scores + attn_mask
+
+        # Normalize the scores to probabilities.
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # Compute attention output by weighted sum of values.
+        # (N*num_heads, L, head_dim)
+        attn_output = torch.bmm(attn_weights, v)
+
+        # 4. Reshape back to (L, N, E).
+        # First, reshape to (N, num_heads, L, head_dim)
+        attn_output = attn_output.view(N, self.num_heads, L, self.head_dim)
+        # Then, permute to (L, N, num_heads, head_dim)
+        attn_output = attn_output.permute(2, 0, 1, 3)
+        # Finally, combine heads to get (L, N, E)
+        attn_output = attn_output.reshape(L, N, E)
+
+        # 5. Apply the output projection.
+        attn_output = self.out_proj(attn_output)
+
+        if need_weights:
+            # Optionally return average attention weights across heads.
+            attn_weights = attn_weights.view(N, self.num_heads, L, S)
+            attn_weights = attn_weights.sum(dim=1) / self.num_heads  # (N, L, S)
+            return attn_output, attn_weights
+
+        return attn_output, None
+
+
+from collections import OrderedDict
+
+class ResidualAttentionBlock(nn.Module):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, dropout: float = 0.0):
+        super().__init__()
+        # Use the custom multihead attention module.
+        self.attn = CustomMultiheadAttention(d_model, n_head, dropout=dropout)
+        self.ln_1 = nn.LayerNorm(d_model)  # Using nn.LayerNorm for normalization.
+        
+        # Define the MLP with two linear layers and a GELU activation.
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
-            ("gelu", QuickGELU()),
+            ("gelu", nn.GELU()),  # You can replace this with your QuickGELU if needed.
             ("c_proj", nn.Linear(d_model * 4, d_model))
         ]))
-        self.ln_2 = LayerNorm(d_model)
+        self.ln_2 = nn.LayerNorm(d_model)
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        # Ensure the attention mask is on the correct device and type.
+        attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        # Call the custom attention module.
+        out, _ = self.attn(x, x, x, attn_mask=attn_mask, need_weights=False)
+        return out
 
     def forward(self, x: torch.Tensor):
+        # Apply attention with a residual connection.
         x = x + self.attention(self.ln_1(x))
+        # Apply MLP with a residual connection.
         x = x + self.mlp(self.ln_2(x))
         return x
+
 
 
 class Transformer(nn.Module):
@@ -317,7 +516,12 @@ class CLIP(nn.Module):
         attn_std = self.transformer.width ** -0.5
         fc_std = (2 * self.transformer.width) ** -0.5
         for block in self.transformer.resblocks:
-            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            # nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            
+            nn.init.normal_(block.attn.q_proj.weight, std=attn_std)
+            nn.init.normal_(block.attn.k_proj.weight, std=attn_std)
+            nn.init.normal_(block.attn.v_proj.weight, std=attn_std)
+
             nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
@@ -372,28 +576,28 @@ class CLIP(nn.Module):
         return logits_per_image, logits_per_text
 
 
-def convert_weights(model: nn.Module):
-    """Convert applicable model parameters to fp16"""
+# def convert_weights(model: nn.Module):
+#     """Convert applicable model parameters to fp16"""
 
-    def _convert_weights_to_fp16(l):
-        if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
-            l.weight.data = l.weight.data.half()
-            if l.bias is not None:
-                l.bias.data = l.bias.data.half()
+#     def _convert_weights_to_fp16(l):
+#         if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+#             l.weight.data = l.weight.data.half()
+#             if l.bias is not None:
+#                 l.bias.data = l.bias.data.half()
 
-        if isinstance(l, nn.MultiheadAttention):
-            for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
-                tensor = getattr(l, attr)
-                if tensor is not None:
-                    tensor.data = tensor.data.half()
+#         if isinstance(l, nn.MultiheadAttention):
+#             for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
+#                 tensor = getattr(l, attr)
+#                 if tensor is not None:
+#                     tensor.data = tensor.data.half()
 
-        for name in ["text_projection", "proj"]:
-            if hasattr(l, name):
-                attr = getattr(l, name)
-                if attr is not None:
-                    attr.data = attr.data.half()
+#         for name in ["text_projection", "proj"]:
+#             if hasattr(l, name):
+#                 attr = getattr(l, name)
+#                 if attr is not None:
+#                     attr.data = attr.data.half()
 
-    model.apply(_convert_weights_to_fp16)
+#     model.apply(_convert_weights_to_fp16)
 
 
 def build_model(state_dict: dict):
@@ -401,7 +605,7 @@ def build_model(state_dict: dict):
 
     if vit:
         vision_width = state_dict["visual.conv1.weight"].shape[0]
-        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.q_proj.weight")])
         vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
         grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
         image_resolution = vision_patch_size * grid_size
@@ -420,7 +624,7 @@ def build_model(state_dict: dict):
     transformer_width = state_dict["ln_final.weight"].shape[0]
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
-
+    print(vision_layers)
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
@@ -431,6 +635,6 @@ def build_model(state_dict: dict):
         if key in state_dict:
             del state_dict[key]
 
-    convert_weights(model)
+    # convert_weights(model)
     model.load_state_dict(state_dict)
     return model.eval()
