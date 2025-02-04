@@ -1,3 +1,16 @@
+
+8 bit compression on fully connected layers including attn layers , model(ViT-B/32) size goes from 338 mb to 176 mb . accuracy on cifar 10 sees 0.3 % drop on top 1 accuracy and 1.6% on top 5 accuracy , This method works better than naive 8bit quant ( 2.2% better score on top 1 with no change in top 5 accuracy)
+
+Technique :- 
+
+each linear layer (Q ) has been decomposed using svd with a rank value of 8 . l1 and l2 represent the 2 matrices after decomposition . remainder ( Q-l1@l2) is 8 bit quanitsed . This approach gives a better result than directly quantising Q for almost no change in inference or ram consumption
+
+sdv.ipynb shows how compression was achieved 
+
+test.ipynb shows model loading and benchmarking
+
+
+
 # CLIP
 
 [[Blog]](https://openai.com/blog/clip/) [[Paper]](https://arxiv.org/abs/2103.00020) [[Model Card]](model-card.md) [[Colab]](https://colab.research.google.com/github/openai/clip/blob/master/notebooks/Interacting_with_CLIP.ipynb)
